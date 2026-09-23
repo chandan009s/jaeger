@@ -125,66 +125,11 @@ func TestAnonymizer_SaveMapping(t *testing.T) {
 	}
 }
 
-func TestAnonymizer_FilterStandardTags(t *testing.T) {
-	expected := []model.KeyValue{
-		model.Bool("error", true),
-		model.String("http.method", http.MethodPost),
-	}
-	actual := filterStandardTags(tags)
-	assert.Equal(t, expected, actual)
-}
-
-func TestAnonymizer_FilterCustomTags(t *testing.T) {
-	expected := []model.KeyValue{
-		model.Bool("foobar", true),
-	}
-	actual := filterCustomTags(tags)
-	assert.Equal(t, expected, actual)
-}
-
 func TestAnonymizer_Hash(t *testing.T) {
 	data := "foobar"
 	expected := "340d8765a4dda9c2"
 	actual := hash(data)
 	assert.Equal(t, expected, actual)
-}
-
-func TestAnonymizer_AnonymizeSpan_AllTrue(t *testing.T) {
-	anonymizer := &Anonymizer{
-		mapping: mapping{
-			Services:   make(map[string]string),
-			Operations: make(map[string]string),
-		},
-		options: Options{
-			HashStandardTags: true,
-			HashCustomTags:   true,
-			HashProcess:      true,
-			HashLogs:         true,
-		},
-	}
-	_ = anonymizer.AnonymizeSpan(span1)
-	assert.Len(t, span1.Tags, 3)
-	assert.Len(t, span1.Logs, 1)
-	assert.Len(t, span1.Process.Tags, 3)
-}
-
-func TestAnonymizer_AnonymizeSpan_AllFalse(t *testing.T) {
-	anonymizer := &Anonymizer{
-		mapping: mapping{
-			Services:   make(map[string]string),
-			Operations: make(map[string]string),
-		},
-		options: Options{
-			HashStandardTags: false,
-			HashCustomTags:   false,
-			HashProcess:      false,
-			HashLogs:         false,
-		},
-	}
-	_ = anonymizer.AnonymizeSpan(span2)
-	assert.Len(t, span2.Tags, 2)
-	assert.Empty(t, span2.Logs)
-	assert.Empty(t, span2.Process.Tags)
 }
 
 func TestAnonymizer_MapString_Present(t *testing.T) {

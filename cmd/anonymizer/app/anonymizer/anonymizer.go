@@ -15,18 +15,17 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/jaegertracing/jaeger-idl/model/v1"
-	"github.com/jaegertracing/jaeger/internal/uimodel"
-	uiconv "github.com/jaegertracing/jaeger/internal/uimodel/converter/v1/json"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
 var allowedTags = map[string]bool{
-	"error":               true,
-	"http.method":         true,
-	"http.status_code":    true,
-	model.SpanKindKey:     true,
-	model.SamplerTypeKey:  true,
-	model.SamplerParamKey: true,
+	"error":            true,
+	"http.method":      true,
+	"http.status_code": true,
+	"span.kind":        true,
+	"sampler.type":     true,
+	"sampler.param":    true,
 }
 
 const PermUserRW = 0o600 // Read-write for owner only
@@ -148,87 +147,142 @@ func hash(value string) string {
 	return fmt.Sprintf("%016x", h.Sum64())
 }
 
-// AnonymizeSpan obfuscates and converts the span.
-func (a *Anonymizer) AnonymizeSpan(span *model.Span) *uimodel.Span {
-	service := span.Process.ServiceName
-	span.OperationName = a.mapOperationName(service, span.OperationName)
+func (a *Anonymizer) AnonymizeTraces(traces ptrace.Traces) {
+	for i := 0; i < traces.ResourceSpans().Len(); i++ {
+		resourceSpans := traces.ResourceSpans().At(i)
+		resource := resourceSpans.Resource()
 
-	outputTags := filterStandardTags(span.Tags)
-	// when true, the allowedTags are hashed and when false they are preserved as it is
-	if a.options.HashStandardTags {
-		outputTags = hashTags(outputTags)
-	}
-	// when true, all tags other than allowedTags are hashed, when false they are dropped
-	if a.options.HashCustomTags {
-		customTags := hashTags(filterCustomTags(span.Tags))
-		outputTags = append(outputTags, customTags...)
-	}
-	span.Tags = outputTags
-
-	// when true, logs are hashed, when false, they are dropped
-	if a.options.HashLogs {
-		for _, log := range span.Logs {
-			log.Fields = hashTags(log.Fields)
+		service := ""
+		if value, ok := resource.Attributes().Get("service.name"); ok {
+			service = value.Str()
 		}
-	} else {
-		span.Logs = nil
-	}
 
-	span.Process.ServiceName = a.mapServiceName(service)
+		resource.Attributes().PutStr("service.name", a.mapServiceName(service))
 
-	// when true, process tags are hashed, when false they are dropped
-	if a.options.HashProcess {
-		span.Process.Tags = hashTags(span.Process.Tags)
-	} else {
-		span.Process.Tags = nil
-	}
+		if a.options.HashProcess {
+			var processAttrs []attribute
 
-	span.Warnings = nil
-	return uiconv.FromDomainEmbedProcess(span)
-}
-
-// filterStandardTags returns only allowedTags
-func filterStandardTags(tags []model.KeyValue) []model.KeyValue {
-	out := make([]model.KeyValue, 0, len(tags))
-	for _, tag := range tags {
-		if !allowedTags[tag.Key] {
-			continue
-		}
-		if tag.Key == "error" {
-			switch tag.VType {
-			case model.BoolType:
-				// allowed
-			case model.StringType:
-				if tag.VStr != "true" && tag.VStr != "false" {
-					tag = model.Bool("error", true)
+			resource.Attributes().Range(func(key string, value pcommon.Value) bool {
+				if key != "service.name" {
+					processAttrs = append(processAttrs, attribute{
+						key:   key,
+						value: value,
+					})
 				}
-			default:
-				tag = model.Bool("error", true)
+				return true
+			})
+
+			resource.Attributes().Clear()
+			resource.Attributes().PutStr("service.name", a.mapServiceName(service))
+
+			for _, attr := range processAttrs {
+				resource.Attributes().PutStr(
+					hash(attr.key),
+					hash(attr.value.AsString()),
+				)
+			}
+		} else {
+			resource.Attributes().RemoveIf(func(key string, _ pcommon.Value) bool {
+				return key != "service.name"
+			})
+		}
+
+		scopeSpans := resourceSpans.ScopeSpans()
+		for j := 0; j < scopeSpans.Len(); j++ {
+			spans := scopeSpans.At(j).Spans()
+
+			for k := 0; k < spans.Len(); k++ {
+				span := spans.At(k)
+
+				span.SetName(a.mapOperationName(service, span.Name()))
+				span.Attributes().Remove("@jaeger@warnings")
+				a.anonymizeAttributes(span.Attributes())
+				if a.options.HashLogs {
+					for i := 0; i < span.Events().Len(); i++ {
+						hashAttributes(span.Events().At(i).Attributes())
+					}
+				} else {
+					span.Events().RemoveIf(func(ptrace.SpanEvent) bool {
+						return true
+					})
+				}
 			}
 		}
-		out = append(out, tag)
 	}
-	return out
 }
 
-// filterCustomTags returns all tags other than allowedTags
-func filterCustomTags(tags []model.KeyValue) []model.KeyValue {
-	out := make([]model.KeyValue, 0, len(tags))
-	for _, tag := range tags {
-		if !allowedTags[tag.Key] {
-			out = append(out, tag)
+func (a *Anonymizer) anonymizeAttributes(attributes pcommon.Map) {
+	var standard []attribute
+	var custom []attribute
+
+	attributes.Range(func(key string, value pcommon.Value) bool {
+		attr := attribute{
+			key:   key,
+			value: value,
+		}
+
+		if allowedTags[key] {
+			if key == "error" {
+				switch value.Type() {
+				case pcommon.ValueTypeBool:
+					// Keep boolean error values as-is.
+				case pcommon.ValueTypeStr:
+					if value.Str() != "true" && value.Str() != "false" {
+						value = pcommon.NewValueBool(true)
+					}
+				default:
+					value = pcommon.NewValueBool(true)
+				}
+			}
+
+			standard = append(standard, attribute{
+				key:   key,
+				value: value,
+			})
+		} else {
+			custom = append(custom, attr)
+		}
+		return true
+	})
+
+	attributes.Clear()
+
+	if a.options.HashStandardTags {
+		for _, attr := range standard {
+			attributes.PutStr(hash(attr.key), hash(attr.value.AsString()))
+		}
+	} else {
+		for _, attr := range standard {
+			attr.value.CopyTo(attributes.PutEmpty(attr.key))
 		}
 	}
-	return out
+
+	if a.options.HashCustomTags {
+		for _, attr := range custom {
+			attributes.PutStr(hash(attr.key), hash(attr.value.AsString()))
+		}
+	}
 }
 
-// hashTags converts each tag into corresponding string values
-// and then find its hash
-func hashTags(tags []model.KeyValue) []model.KeyValue {
-	out := make([]model.KeyValue, 0, len(tags))
-	for _, tag := range tags {
-		kv := model.String(hash(tag.Key), hash(tag.AsString()))
-		out = append(out, kv)
+func hashAttributes(attributes pcommon.Map) {
+	var attrs []attribute
+
+	attributes.Range(func(key string, value pcommon.Value) bool {
+		attrs = append(attrs, attribute{
+			key:   key,
+			value: value,
+		})
+		return true
+	})
+
+	attributes.Clear()
+
+	for _, attr := range attrs {
+		attributes.PutStr(hash(attr.key), hash(attr.value.AsString()))
 	}
-	return out
+}
+
+type attribute struct {
+	key   string
+	value pcommon.Value
 }

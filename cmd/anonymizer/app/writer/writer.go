@@ -4,25 +4,19 @@
 package writer
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"sync"
 
-	"github.com/gogo/protobuf/jsonpb"
 	"go.uber.org/zap"
 
-	"github.com/jaegertracing/jaeger-idl/model/v1"
 	"github.com/jaegertracing/jaeger/cmd/anonymizer/app/anonymizer"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 )
-
-var ErrMaxSpansCountReached = errors.New("max spans count reached")
 
 // Config contains parameters to NewWriter.
 type Config struct {
-	MaxSpansCount  int                `yaml:"max_spans_count" name:"max_spans_count"`
 	CapturedFile   string             `yaml:"captured_file" name:"captured_file"`
 	AnonymizedFile string             `yaml:"anonymized_file" name:"anonymized_file"`
 	MappingFile    string             `yaml:"mapping_file" name:"mapping_file"`
@@ -61,15 +55,6 @@ func New(config Config, logger *zap.Logger) (*Writer, error) {
 	}
 	logger.Sugar().Infof("Writing anonymized spans to file %s", config.AnonymizedFile)
 
-	_, err = cf.WriteString("[")
-	if err != nil {
-		return nil, fmt.Errorf("cannot write tp output file: %w", err)
-	}
-	_, err = af.WriteString("[")
-	if err != nil {
-		return nil, fmt.Errorf("cannot write tp output file: %w", err)
-	}
-
 	options := anonymizer.Options{
 		HashStandardTags: config.AnonymizerOpts.HashStandardTags,
 		HashCustomTags:   config.AnonymizerOpts.HashCustomTags,
@@ -86,51 +71,50 @@ func New(config Config, logger *zap.Logger) (*Writer, error) {
 	}, nil
 }
 
-// WriteSpan anonymized the span and appends it as JSON to w.file.
-func (w *Writer) WriteSpan(msg *model.Span) error {
+// WriteTraces writes the original and anonymized traces as OTLP JSON.
+func (w *Writer) WriteTraces(traces ptrace.Traces) error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 
 	if w.closed {
-		if w.config.MaxSpansCount > 0 && w.spanCount >= w.config.MaxSpansCount {
-			return ErrMaxSpansCountReached
-		}
 		return errors.New("writer is closed")
 	}
 
-	out := new(bytes.Buffer)
-	if err := new(jsonpb.Marshaler).Marshal(out, msg); err != nil {
-		return err
-	}
-	if w.spanCount > 0 {
-		w.capturedFile.WriteString(",\n")
-	}
-	w.capturedFile.Write(out.Bytes())
-	w.capturedFile.Sync()
+	marshaler := new(ptrace.JSONMarshaler)
 
-	span := w.anonymizer.AnonymizeSpan(msg)
-
-	dat, err := json.Marshal(span)
+	original, err := marshaler.MarshalTraces(traces)
 	if err != nil {
 		return err
 	}
-	if w.spanCount > 0 {
-		w.anonymizedFile.WriteString(",\n")
-	}
-	if _, err := w.anonymizedFile.Write(dat); err != nil {
+
+	if _, err := w.capturedFile.Write(original); err != nil {
 		return err
 	}
-	w.anonymizedFile.Sync()
 
-	w.spanCount++
-	if w.spanCount%100 == 0 {
-		w.logger.Info("progress", zap.Int("numSpans", w.spanCount))
+	anonymized := ptrace.NewTraces()
+	traces.CopyTo(anonymized)
+	w.anonymizer.AnonymizeTraces(anonymized)
+
+	data, err := marshaler.MarshalTraces(anonymized)
+	if err != nil {
+		return err
 	}
 
-	if w.config.MaxSpansCount > 0 && w.spanCount >= w.config.MaxSpansCount {
-		w.logger.Info("Saved enough spans, exiting...")
-		w.closeLocked()
-		return ErrMaxSpansCountReached
+	if _, err := w.anonymizedFile.Write(data); err != nil {
+		return err
+	}
+
+	if err := w.capturedFile.Sync(); err != nil {
+		return err
+	}
+	if err := w.anonymizedFile.Sync(); err != nil {
+		return err
+	}
+
+	w.spanCount += traces.SpanCount()
+
+	if w.spanCount%100 == 0 {
+		w.logger.Info("progress", zap.Int("numSpans", w.spanCount))
 	}
 
 	return nil
@@ -150,11 +134,9 @@ func (w *Writer) closeLocked() {
 	w.closed = true
 
 	if w.capturedFile != nil {
-		w.capturedFile.WriteString("\n]\n")
 		w.capturedFile.Close()
 	}
 	if w.anonymizedFile != nil {
-		w.anonymizedFile.WriteString("\n]\n")
 		w.anonymizedFile.Close()
 	}
 	if w.anonymizer != nil {

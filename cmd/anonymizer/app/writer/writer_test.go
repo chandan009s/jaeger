@@ -5,7 +5,6 @@ package writer
 
 import (
 	"encoding/json"
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,38 +14,35 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
-	"github.com/jaegertracing/jaeger-idl/model/v1"
-	"github.com/jaegertracing/jaeger/cmd/anonymizer/app/uiconv"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 )
 
-var tags = []model.KeyValue{
-	model.Bool("error", true),
-	model.String("http.method", http.MethodPost),
-	model.Bool("foobar", true),
-}
+var testTraces = func() ptrace.Traces {
+	traces := ptrace.NewTraces()
 
-var traceID = model.NewTraceID(1, 2)
+	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	resource := resourceSpans.Resource()
+	resource.Attributes().PutStr("service.name", "serviceName")
+	resource.Attributes().PutStr("process.foo", "processValue")
 
-var span = &model.Span{
-	TraceID: traceID,
-	SpanID:  model.NewSpanID(1),
-	Process: &model.Process{
-		ServiceName: "serviceName",
-		Tags:        tags,
-	},
-	OperationName: "operationName",
-	Tags:          tags,
-	Logs: []model.Log{
-		{
-			Timestamp: time.Now(),
-			Fields: []model.KeyValue{
-				model.String("logKey", "logValue"),
-			},
-		},
-	},
-	Duration:  time.Second * 5,
-	StartTime: time.Unix(300, 0),
-}
+	scopeSpans := resourceSpans.ScopeSpans().AppendEmpty()
+	span := scopeSpans.Spans().AppendEmpty()
+
+	span.SetName("operationName")
+	span.Attributes().PutBool("error", true)
+	span.Attributes().PutStr("http.method", http.MethodPost)
+	span.Attributes().PutBool("foobar", true)
+
+	event := span.Events().AppendEmpty()
+	event.SetName("test-event")
+	event.Attributes().PutStr("logKey", "logValue")
+
+	span.SetStartTimestamp(pcommon.Timestamp(time.Unix(300, 0).UnixNano()))
+	span.SetEndTimestamp(pcommon.Timestamp(time.Unix(305, 0).UnixNano()))
+
+	return traces
+}()
 
 func TestNew(t *testing.T) {
 	nopLogger := zap.NewNop()
@@ -54,7 +50,6 @@ func TestNew(t *testing.T) {
 
 	t.Run("no error", func(t *testing.T) {
 		config := Config{
-			MaxSpansCount:  10,
 			CapturedFile:   tempDir + "/captured.json",
 			AnonymizedFile: tempDir + "/anonymized.json",
 			MappingFile:    tempDir + "/mapping.json",
@@ -85,44 +80,6 @@ func TestNew(t *testing.T) {
 	})
 }
 
-func TestWriter_WriteSpan(t *testing.T) {
-	nopLogger := zap.NewNop()
-	t.Run("write span", func(t *testing.T) {
-		tempDir := t.TempDir()
-		config := Config{
-			MaxSpansCount:  10,
-			CapturedFile:   tempDir + "/captured.json",
-			AnonymizedFile: tempDir + "/anonymized.json",
-			MappingFile:    tempDir + "/mapping.json",
-		}
-
-		writer, err := New(config, nopLogger)
-		require.NoError(t, err)
-		defer writer.Close()
-
-		for range 9 {
-			err = writer.WriteSpan(span)
-			require.NoError(t, err)
-		}
-	})
-	t.Run("write span with MaxSpansCount", func(t *testing.T) {
-		tempDir := t.TempDir()
-		config := Config{
-			MaxSpansCount:  1,
-			CapturedFile:   tempDir + "/captured.json",
-			AnonymizedFile: tempDir + "/anonymized.json",
-			MappingFile:    tempDir + "/mapping.json",
-		}
-
-		writer, err := New(config, zap.NewNop())
-		require.NoError(t, err)
-		defer writer.Close()
-
-		err = writer.WriteSpan(span)
-		require.ErrorIs(t, err, ErrMaxSpansCountReached)
-	})
-}
-
 // TestWriter_TruncatesExistingFile verifies that writer.New() truncates
 // existing output files via O_TRUNC, preventing stale data.
 func TestWriter_TruncatesExistingFile(t *testing.T) {
@@ -140,13 +97,16 @@ func TestWriter_TruncatesExistingFile(t *testing.T) {
 
 	// Create writer with existing files - should truncate them
 	config := Config{
-		MaxSpansCount:  10,
 		CapturedFile:   capturedFile,
 		AnonymizedFile: anonymizedFile,
 		MappingFile:    mappingFile,
 	}
 	writer, err := New(config, zap.NewNop())
 	require.NoError(t, err)
+
+	err = writer.WriteTraces(testTraces)
+	require.NoError(t, err)
+
 	writer.Close()
 
 	// Verify old content is gone from captured file
@@ -176,7 +136,6 @@ func TestWriter_CloseIdempotent(t *testing.T) {
 	mappingFile := filepath.Join(tempDir, "mapping.json")
 
 	config := Config{
-		MaxSpansCount:  5,
 		CapturedFile:   capturedFile,
 		AnonymizedFile: anonymizedFile,
 		MappingFile:    mappingFile,
@@ -185,7 +144,7 @@ func TestWriter_CloseIdempotent(t *testing.T) {
 	w, err := New(config, zap.NewNop())
 	require.NoError(t, err)
 
-	err = w.WriteSpan(span)
+	err = w.WriteTraces(testTraces)
 	require.NoError(t, err)
 
 	// Multiple calls to Close() should not error or corrupt files
@@ -193,80 +152,47 @@ func TestWriter_CloseIdempotent(t *testing.T) {
 	w.Close()
 	w.Close()
 
-	var captured []any
 	capturedData, err := os.ReadFile(capturedFile)
 	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(capturedData, &captured))
-	require.Len(t, captured, 1)
 
-	var anonymized []any
+	var captured map[string]any
+	require.NoError(t, json.Unmarshal(capturedData, &captured))
+	require.NotEmpty(t, captured)
+
 	anonymizedData, err := os.ReadFile(anonymizedFile)
 	require.NoError(t, err)
+
+	var anonymized map[string]any
 	require.NoError(t, json.Unmarshal(anonymizedData, &anonymized))
-	require.Len(t, anonymized, 1)
+	require.NotEmpty(t, anonymized)
 }
 
-func TestWriter_MaxSpansCountAndUIExtraction(t *testing.T) {
+func TestWriter_WritesOTLPJSON(t *testing.T) {
 	tempDir := t.TempDir()
-	capturedFile := filepath.Join(tempDir, "captured.json")
-	anonymizedFile := filepath.Join(tempDir, "anonymized.json")
-	mappingFile := filepath.Join(tempDir, "mapping.json")
-	uiFile := filepath.Join(tempDir, "ui.json")
 
 	config := Config{
-		MaxSpansCount:  2,
-		CapturedFile:   capturedFile,
-		AnonymizedFile: anonymizedFile,
-		MappingFile:    mappingFile,
+		CapturedFile:   filepath.Join(tempDir, "captured.json"),
+		AnonymizedFile: filepath.Join(tempDir, "anonymized.json"),
+		MappingFile:    filepath.Join(tempDir, "mapping.json"),
 	}
 
 	w, err := New(config, zap.NewNop())
 	require.NoError(t, err)
 
-	spans := []*model.Span{span, span, span}
-	for _, s := range spans {
-		if err := w.WriteSpan(s); err != nil {
-			if errors.Is(err, ErrMaxSpansCountReached) {
-				break
-			}
-		}
-	}
-	// Calling Close() after loop breaks on ErrMaxSpansCountReached
+	require.NoError(t, w.WriteTraces(testTraces))
 	w.Close()
 
-	// Subsequent WriteSpan should return ErrMaxSpansCountReached
-	err = w.WriteSpan(span)
-	require.ErrorIs(t, err, ErrMaxSpansCountReached)
-
-	// Both files must be valid JSON arrays with exactly 2 spans
-	var captured []any
-	capturedData, err := os.ReadFile(capturedFile)
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(capturedData, &captured))
-	require.Len(t, captured, 2)
-
-	var anonymized []any
-	anonymizedData, err := os.ReadFile(anonymizedFile)
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(anonymizedData, &anonymized))
-	require.Len(t, anonymized, 2)
-
-	// UI extraction must succeed on the capped anonymized file
-	err = uiconv.Extract(uiconv.Config{
-		CapturedFile: anonymizedFile,
-		UIFile:       uiFile,
-		TraceID:      traceID.String(),
-	}, zap.NewNop())
+	capturedData, err := os.ReadFile(config.CapturedFile)
 	require.NoError(t, err)
 
-	uiData, err := os.ReadFile(uiFile)
+	captured, err := new(ptrace.JSONUnmarshaler).UnmarshalTraces(capturedData)
 	require.NoError(t, err)
-	var uiObj struct {
-		Data []struct {
-			Spans []any `json:"spans"`
-		} `json:"data"`
-	}
-	require.NoError(t, json.Unmarshal(uiData, &uiObj))
-	require.Len(t, uiObj.Data, 1)
-	require.Len(t, uiObj.Data[0].Spans, 2)
+	require.Equal(t, 1, captured.SpanCount())
+
+	anonymizedData, err := os.ReadFile(config.AnonymizedFile)
+	require.NoError(t, err)
+
+	anonymized, err := new(ptrace.JSONUnmarshaler).UnmarshalTraces(anonymizedData)
+	require.NoError(t, err)
+	require.Equal(t, 1, anonymized.SpanCount())
 }
